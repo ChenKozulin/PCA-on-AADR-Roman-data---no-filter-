@@ -1,0 +1,437 @@
+import pandas as pd
+import numpy as np
+import struct
+import matplotlib.pyplot as plt
+import seaborn as sns
+import os
+from sklearn.decomposition import PCA
+from sklearn.preprocessing import StandardScaler
+from sklearn.impute import SimpleImputer
+os.chdir('/Users/henrik/perkele/momentum MSCA/database/Filtered Roman Data')
+
+
+class BinaryPlinkLoader:
+    def __init__(self, geno_file, snp_file, ind_file):
+        self.geno_file = geno_file
+        self.snp_file = snp_file
+        self.ind_file = ind_file
+        self.ind_df = None
+        self.snp_df = None
+        self.genotype_matrix = None
+        self.pca_results = None
+    
+    def load_metadata(self):
+        """Load .ind and .snp files"""
+        print("Loading metadata files...")
+        
+        # Load individual data
+        self.ind_df = pd.read_csv(self.ind_file, sep=r'\s+', header=None,
+                                 names=['Sample_ID', 'Sex', 'Population'])
+        print(f"Loaded {len(self.ind_df)} individuals")
+        
+        # Load SNP data
+        self.snp_df = pd.read_csv(self.snp_file, sep=r'\s+', header=None,
+                                 names=['SNP_ID', 'Chromosome', 'Genetic_Distance',
+                                        'Physical_Position', 'Ref_Allele', 'Alt_Allele'])
+        print(f"Loaded {len(self.snp_df)} SNPs")
+        
+        return self
+    
+    def analyze_binary_format(self):
+        """Analyze the binary .geno file structure"""
+        print("Analyzing binary .geno file...")
+        
+        n_samples = len(self.ind_df)
+        n_snps = len(self.snp_df)
+        
+        with open(self.geno_file, 'rb') as f:
+            # Read first few bytes to understand header
+            header = f.read(50)
+            print(f"Header bytes: {header}")
+            print(f"Header as string: {header.decode('latin1', errors='ignore')}")
+            
+            # Get file size
+            f.seek(0, 2)  # Seek to end
+            file_size = f.tell()
+            f.seek(0)  # Back to start
+            
+            print(f"File size: {file_size} bytes")
+            print(f"Expected data size: {n_samples} × {n_snps} = {n_samples * n_snps}")
+            
+            # Try to find the data start
+            # Look for patterns that might indicate genotype data
+            f.seek(0)
+            data = f.read(min(1000, file_size))
+            
+            # Look for the string "GENO" and extract numbers
+            header_str = data.decode('latin1', errors='ignore')
+            if 'GENO' in header_str:
+                geno_pos = header_str.find('GENO')
+                after_geno = header_str[geno_pos:geno_pos+20]
+                print(f"After GENO: '{after_geno}'")
+        
+        return self
+    
+    def load_binary_genotypes_v1(self, max_snps=None):
+        """
+        Attempt 1: Try to read as packed binary format
+        Each genotype might be stored as 2 bits (4 genotypes per byte)
+        """
+        print("Attempting binary format v1 (packed bits)...")
+        
+        n_samples = len(self.ind_df)
+        n_snps = len(self.snp_df)
+        
+        with open(self.geno_file, 'rb') as f:
+            # Skip header - try different header sizes
+            for header_size in [0, 3, 8, 16, 24]:
+                f.seek(header_size)
+                print(f"Trying header size: {header_size}")
+                
+                genotypes = []
+                bytes_per_snp = (n_samples + 3) // 4  # 2 bits per genotype, 4 genotypes per byte
+                
+                try:
+                    for snp_idx in range(min(100, n_snps)):  # Test first 100 SNPs
+                        if max_snps and snp_idx >= max_snps:
+                            break
+                            
+                        # Read bytes for this SNP
+                        snp_bytes = f.read(bytes_per_snp)
+                        if len(snp_bytes) < bytes_per_snp:
+                            break
+                        
+                        # Unpack genotypes from bytes
+                        snp_genotypes = []
+                        for byte in snp_bytes:
+                            # Extract 4 genotypes from each byte (2 bits each)
+                            for shift in [0, 2, 4, 6]:
+                                if len(snp_genotypes) >= n_samples:
+                                    break
+                                geno = (byte >> shift) & 0b11
+                                snp_genotypes.append(geno)
+                        
+                        genotypes.append(snp_genotypes[:n_samples])
+                    
+                    if len(genotypes) > 0:
+                        print(f"Success with header size {header_size}! Loaded {len(genotypes)} SNPs")
+                        # Check if genotypes look reasonable
+                        all_genos = np.concatenate(genotypes)
+                        unique_vals = np.unique(all_genos)
+                        print(f"Unique genotype values: {unique_vals}")
+                        
+                        if set(unique_vals).issubset({0, 1, 2, 3}):
+                            print("Genotype values look reasonable!")
+                            self.genotype_matrix = np.array(genotypes).T
+                            return self
+                        
+                except Exception as e:
+                    print(f"Failed with header size {header_size}: {e}")
+                    continue
+        
+        print("Binary format v1 failed")
+        return self
+    
+    def load_binary_genotypes_v2(self, max_snps=None):
+        """
+        Attempt 2: Try to read as byte-per-genotype format
+        """
+        print("Attempting binary format v2 (byte per genotype)...")
+        
+        n_samples = len(self.ind_df)
+        n_snps = len(self.snp_df)
+        
+        with open(self.geno_file, 'rb') as f:
+            # Try different header sizes
+            for header_size in [3, 8, 12, 16, 24]:
+                f.seek(header_size)
+                print(f"Trying header size: {header_size}")
+                
+                genotypes = []
+                
+                try:
+                    for snp_idx in range(min(100, n_snps)):
+                        if max_snps and snp_idx >= max_snps:
+                            break
+                            
+                        # Read n_samples bytes
+                        snp_bytes = f.read(n_samples)
+                        if len(snp_bytes) < n_samples:
+                            break
+                        
+                        # Convert bytes to genotypes
+                        snp_genotypes = []
+                        for byte in snp_bytes:
+                            # Try different interpretations
+                            if byte in [0, 1, 2, 9]:  # Standard genotype codes
+                                snp_genotypes.append(byte)
+                            elif byte == 255:  # Might be missing data
+                                snp_genotypes.append(9)
+                            else:
+                                # Try to map to 0-2 range
+                                mapped = byte % 4
+                                if mapped == 3:
+                                    mapped = 9  # Missing
+                                snp_genotypes.append(mapped)
+                        
+                        genotypes.append(snp_genotypes)
+                    
+                    if len(genotypes) > 0:
+                        print(f"Success with header size {header_size}! Loaded {len(genotypes)} SNPs")
+                        all_genos = np.concatenate(genotypes)
+                        unique_vals = np.unique(all_genos)
+                        print(f"Unique genotype values: {unique_vals}")
+                        
+                        # Check if reasonable
+                        reasonable_vals = set([0, 1, 2, 9]) | set(range(256))
+                        if len(set(unique_vals) - reasonable_vals) == 0:
+                            print("Genotype values look reasonable!")
+                            self.genotype_matrix = np.array(genotypes).T
+                            return self
+                        
+                except Exception as e:
+                    print(f"Failed with header size {header_size}: {e}")
+                    continue
+        
+        print("Binary format v2 failed")
+        return self
+    
+    def try_eigensoft_format(self, max_snps=None):
+        """
+        Try EIGENSOFT binary format
+        Header: "GENO" + 4 bytes for n_samples + genotypes
+        """
+        print("Attempting EIGENSOFT binary format...")
+        
+        n_samples = len(self.ind_df)
+        n_snps = len(self.snp_df)
+        
+        with open(self.geno_file, 'rb') as f:
+            # Read header
+            header = f.read(4)
+            if header != b'GENO':
+                print("Not EIGENSOFT format (no GENO header)")
+                return self
+            
+            # Read number of samples
+            n_samples_bytes = f.read(4)
+            n_samples_file = struct.unpack('<I', n_samples_bytes)[0]  # Little endian unsigned int
+            
+            print(f"File says {n_samples_file} samples, we expect {n_samples}")
+            
+            if n_samples_file != n_samples:
+                print("Sample count mismatch - trying anyway...")
+            
+            # Try to read genotype data
+            genotypes = []
+            bytes_per_snp = (n_samples_file + 3) // 4  # Packed format
+            
+            # Limit SNPs if specified
+            max_snps_to_read = min(max_snps or 1000, n_snps)
+            
+            try:
+                for snp_idx in range(max_snps_to_read):
+                    snp_bytes = f.read(bytes_per_snp)
+                    if len(snp_bytes) < bytes_per_snp:
+                        break
+                    
+                    # Unpack genotypes
+                    snp_genotypes = []
+                    for byte in snp_bytes:
+                        for shift in [0, 2, 4, 6]:
+                            if len(snp_genotypes) >= n_samples_file:
+                                break
+                            geno = (byte >> shift) & 0b11
+                            # Convert: 0->0, 1->1, 2->2, 3->9 (missing)
+                            if geno == 3:
+                                geno = 9
+                            snp_genotypes.append(geno)
+                    
+                    genotypes.append(snp_genotypes[:n_samples])
+                
+                if len(genotypes) > 0:
+                    print(f"EIGENSOFT format success! Loaded {len(genotypes)} SNPs")
+                    self.genotype_matrix = np.array(genotypes).T
+                    
+                    # Show distribution
+                    all_genos = self.genotype_matrix.flatten()
+                    unique, counts = np.unique(all_genos, return_counts=True)
+                    print("Genotype distribution:")
+                    for val, count in zip(unique, counts):
+                        print(f"  {val}: {count} ({100*count/len(all_genos):.1f}%)")
+                    
+                    return self
+                    
+            except Exception as e:
+                print(f"EIGENSOFT format failed: {e}")
+        
+        return self
+    
+    def load_data(self, max_snps=None):
+        """Load all data with multiple format attempts"""
+        
+        # Load metadata
+        self.load_metadata()
+        
+        # Analyze binary structure
+        self.analyze_binary_format()
+        
+        # Try different binary formats
+        formats_to_try = [
+            self.try_eigensoft_format,
+            self.load_binary_genotypes_v1,
+            self.load_binary_genotypes_v2
+        ]
+        
+        for format_func in formats_to_try:
+            format_func(max_snps)
+            if self.genotype_matrix is not None and self.genotype_matrix.size > 0:
+                print(f"Successfully loaded genotypes with {format_func.__name__}")
+                print(f"Matrix shape: {self.genotype_matrix.shape}")
+                return self
+        
+        print("All binary format attempts failed!")
+        print("You may need to convert your files to standard PLINK text format first.")
+        return self
+    
+    def preprocess_data(self, maf_threshold=0.05, missing_threshold=0.1):
+        """Preprocess genotype data"""
+        if self.genotype_matrix is None or self.genotype_matrix.size == 0:
+            raise ValueError("No genotype data loaded!")
+        
+        print("Preprocessing genotype data...")
+        print(f"Initial shape: {self.genotype_matrix.shape}")
+        
+        n_samples, n_snps = self.genotype_matrix.shape
+        
+        # Make sure SNP dataframe matches the loaded genotype matrix
+        if len(self.snp_df) != n_snps:
+            print(f"Warning: SNP dataframe has {len(self.snp_df)} entries but genotype matrix has {n_snps} SNPs")
+            print("Truncating SNP dataframe to match loaded genotypes...")
+            self.snp_df = self.snp_df.iloc[:n_snps].reset_index(drop=True)
+        
+        # Calculate missing data per SNP
+        missing_per_snp = np.mean(self.genotype_matrix == 9, axis=0)
+        
+        # Calculate MAF per SNP
+        mafs = []
+        for snp_idx in range(n_snps):
+            genotypes = self.genotype_matrix[:, snp_idx]
+            valid_genotypes = genotypes[genotypes != 9]
+            
+            if len(valid_genotypes) > 0:
+                allele_freq = np.mean(valid_genotypes) / 2
+                maf = min(allele_freq, 1 - allele_freq)
+                mafs.append(maf)
+            else:
+                mafs.append(0)
+        
+        mafs = np.array(mafs)
+        
+        # Filter SNPs
+        keep_snps = (missing_per_snp < missing_threshold) & (mafs > maf_threshold)
+        n_keep = np.sum(keep_snps)
+        
+        print(f"Keeping {n_keep} / {n_snps} SNPs")
+        
+        if n_keep == 0:
+            print("Warning: No SNPs passed filtering! Using relaxed thresholds...")
+            keep_snps = (missing_per_snp < 0.5) & (mafs > 0.01)
+            n_keep = np.sum(keep_snps)
+            
+        if n_keep == 0:
+            print("Using all SNPs...")
+            keep_snps = np.ones(n_snps, dtype=bool)
+        
+        # Apply filters
+        self.genotype_matrix = self.genotype_matrix[:, keep_snps]
+        self.snp_df = self.snp_df.iloc[keep_snps].reset_index(drop=True)
+        
+        # Impute missing data
+        imputer = SimpleImputer(missing_values=9, strategy='mean')
+        self.genotype_matrix = imputer.fit_transform(self.genotype_matrix)
+        
+        print(f"Final shape: {self.genotype_matrix.shape}")
+        return self
+    
+    def run_pca(self, n_components=10):
+        """Run PCA analysis"""
+        if self.genotype_matrix is None or self.genotype_matrix.size == 0:
+            raise ValueError("No preprocessed genotype data available!")
+        
+        print("Running PCA...")
+        
+        # Standardize
+        scaler = StandardScaler()
+        scaled_data = scaler.fit_transform(self.genotype_matrix)
+        
+        # PCA
+        n_components = min(n_components, min(self.genotype_matrix.shape))
+        pca = PCA(n_components=n_components)
+        pca_coords = pca.fit_transform(scaled_data)
+        
+        # Store results
+        self.pca_results = {
+            'coordinates': pca_coords,
+            'explained_variance': pca.explained_variance_ratio_,
+            'pca_object': pca
+        }
+        
+        print("PCA Results:")
+        for i, var in enumerate(self.pca_results['explained_variance'][:5]):
+            print(f"PC{i+1}: {var:.3f} ({100*var:.1f}%)")
+        
+        return self
+    
+    def plot_pca(self, figsize=(12, 8)):
+        """Plot PCA results"""
+        if self.pca_results is None:
+            raise ValueError("Run PCA first!")
+        
+        coords = self.pca_results['coordinates']
+        var_explained = self.pca_results['explained_variance']
+        
+        fig, axes = plt.subplots(1, 2, figsize=figsize)
+        
+        # PC1 vs PC2
+        scatter = axes[0].scatter(coords[:, 0], coords[:, 1], 
+                                 c=range(len(coords)), cmap='viridis', alpha=0.7)
+        axes[0].set_xlabel(f'PC1 ({100*var_explained[0]:.1f}%)')
+        axes[0].set_ylabel(f'PC2 ({100*var_explained[1]:.1f}%)')
+        axes[0].set_title('PC1 vs PC2')
+        axes[0].grid(True, alpha=0.3)
+        
+        # Explained variance
+        axes[1].bar(range(1, len(var_explained)+1), var_explained)
+        axes[1].set_xlabel('Principal Component')
+        axes[1].set_ylabel('Explained Variance Ratio')
+        axes[1].set_title('Explained Variance by PC')
+        
+        plt.tight_layout()
+        plt.show()
+        
+        return self
+
+
+# Usage
+if __name__ == "__main__":
+    # Initialize loader
+    loader = BinaryPlinkLoader(
+        "roman_filtered_24062025.geno",
+        "roman_filtered_24062025.snp", 
+        "roman_filtered_24062025.ind"
+    )
+    
+    # Load and analyze
+    loader.load_data(max_snps=1000)  # Start with 1000 SNPs for testing
+    
+    if loader.genotype_matrix is not None and loader.genotype_matrix.size > 0:
+        loader.preprocess_data()
+        loader.run_pca()
+        loader.plot_pca()
+        print("Analysis complete!")
+    else:
+        print("Failed to load genotype data. You may need to:")
+        print("1. Convert files to standard PLINK text format")
+        print("2. Use PLINK software: plink --bfile yourfile --recode --out yourfile_text")
+        print("3. Or provide the original .bed/.bim/.fam files instead")
