@@ -7,7 +7,7 @@ import os
 from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler
 from sklearn.impute import SimpleImputer
-os.chdir('/Users/henrik/perkele/momentum MSCA/database/Filtered Roman Data')
+os.chdir('/Path/to/File')
 
 
 class BinaryPlinkLoader:
